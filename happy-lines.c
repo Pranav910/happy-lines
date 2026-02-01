@@ -1,4 +1,5 @@
 #include <dirent.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,6 +11,11 @@
 
 #define MAIN_HEADER_TITLE_Y 0
 #define MAIN_HEADER_TITLE_X 0
+#define HIDE_CURSOR "\x1b[?25l"
+#define RESTORE_TERMINAL "\x1b[3;1H\x1b[2K\n"
+#define CLEAR_SCREEN "\x1b[2J\x1b[H"
+#define DRAW_AT_FORMAT "\x1b[%d;%dH"
+#define SHOW_CURSOR "\x1b[?25h"
 
 int is_directory(const char *path) {
   struct stat st;
@@ -44,7 +50,8 @@ int count_lines(const char *path) {
   return happy_lines_count;
 }
 
-void count_happy_lines(const char *path, int *total_happy_lines_count, DIR *dr) {
+void count_happy_lines(const char *path, int *total_happy_lines_count,
+                       DIR *dr) {
   if (!dr) {
     return;
   }
@@ -60,8 +67,7 @@ void count_happy_lines(const char *path, int *total_happy_lines_count, DIR *dr) 
       count_happy_lines(full_path, total_happy_lines_count, opendir(full_path));
       strcpy(full_path, path);
     } else if (is_file(full_path)) {
-      *total_happy_lines_count +=
-          count_lines(full_path);
+      *total_happy_lines_count += count_lines(full_path);
     }
   }
 }
@@ -77,14 +83,14 @@ void clear() {
 static struct termios orig_termios;
 
 void die(const char *msg) {
-  write(STDOUT_FILENO, "\x1b[2J\x1b[H", 7);
+  write(STDOUT_FILENO, CLEAR_SCREEN, sizeof(CLEAR_SCREEN) - 1);
   perror(msg);
   exit(1);
 }
 
 void disable_raw_mode() {
   tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
-  write(STDOUT_FILENO, "\x1b[?25h", 6); // show cursor
+  write(STDOUT_FILENO, SHOW_CURSOR, sizeof(SHOW_CURSOR) - 1);
 }
 
 void enable_raw_mode() {
@@ -101,15 +107,21 @@ void enable_raw_mode() {
   if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1)
     die("tcsetattr");
 
-  write(STDOUT_FILENO, "\x1b[?25l", 6); // hide cursor
+  write(STDOUT_FILENO, HIDE_CURSOR, sizeof(HIDE_CURSOR) - 1);
 }
 
-void clear_screen() { write(STDOUT_FILENO, "\x1b[2J\x1b[H", 7); }
+void clear_screen() {
+  write(STDOUT_FILENO, CLEAR_SCREEN, sizeof(CLEAR_SCREEN) - 1);
+}
 
-void draw_at(int y, int x, char *ch) {
-  char buf[32];
-  int len = snprintf(buf, sizeof(buf), "\x1b[%d;%dH%s", y, x, ch);
-  write(STDOUT_FILENO, buf, len);
+void draw_at(int y, int x, const char *fmt, ...) {
+  char buf[1000];
+  int offset = sprintf(buf, DRAW_AT_FORMAT, y, x);
+  va_list args;
+  va_start(args, fmt);
+  offset += vsnprintf(buf + offset, sizeof(buf) - offset, fmt, args);
+  va_end(args);
+  write(STDOUT_FILENO, buf, offset);
 }
 
 enum { KEY_UP = 1000, KEY_DOWN, KEY_LEFT, KEY_RIGHT, KEY_ENTER };
@@ -146,7 +158,11 @@ int read_key() {
   return c;
 }
 
-int main() {
+void restore_terminal() {
+  write(STDOUT_FILENO, RESTORE_TERMINAL, sizeof(RESTORE_TERMINAL) - 1);
+}
+
+int draw_menu() {
   struct dirent *de;
   char path[100] = ".";
   DIR *dr = opendir(path);
@@ -185,7 +201,7 @@ int main() {
 
     int key = read_key();
     if (key == 'q')
-      break;
+      return 0;
     if (key == KEY_ENTER)
       break;
 
@@ -195,15 +211,23 @@ int main() {
       y--;
   }
   clear_screen();
-  printf("Selected directory: %s\n", arr[y - 2]);
+
+  draw_at(1, 0, "Selected directory: %s", arr[y - 2]);
   if (strcmp(path, ".") == 0) {
     strcat(strcat(path, "/"), arr[y - 2]);
   }
+
   dr = opendir(path);
   count_happy_lines(path, &total_happy_lines_count, dr);
 
-  printf("Total happy lines count: %d\n", total_happy_lines_count);
+  draw_at(2, 0, "Total happy lines count: %d", total_happy_lines_count);
 
   closedir(dr);
+  return 0;
+}
+
+int main() {
+  draw_menu();
+  restore_terminal();
   return 0;
 }
