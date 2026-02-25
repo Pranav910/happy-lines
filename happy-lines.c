@@ -1,21 +1,37 @@
+#include "tui.c"
 #include <dirent.h>
-#include <stdarg.h>
+#include <pthread.h>
 #include <stdio.h>
-#include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <termios.h>
-#include <unistd.h>
 
 #define MAIN_HEADER_TITLE_Y 0
 #define MAIN_HEADER_TITLE_X 0
-#define HIDE_CURSOR "\x1b[?25l"
-#define RESTORE_TERMINAL "\x1b[3;1H\x1b[2K\n"
-#define CLEAR_SCREEN "\x1b[2J\x1b[H"
-#define DRAW_AT_FORMAT "\x1b[%d;%dH"
-#define SHOW_CURSOR "\x1b[?25h"
+#define DIRECTORY_MODE 0
+#define FILE_MODE 1
+#define MAX_THREADS 10
+
+struct thread {
+  int thread_id;
+  int start;
+  int end;
+  int total_happy_lines_count;
+  pthread_t thread;
+  char **directories;
+  char (*ignore_folders)[100];
+  int ignore_folders_count;
+  int mode;
+};
+
+int str_cmp(const char *str1, const char *str2) {
+  if (strlen(str1) != strlen(str2)) {
+    return 0;
+  }
+  return strcmp(str1, str2) == 0;
+}
 
 int is_directory(const char *path) {
   struct stat st;
@@ -37,31 +53,26 @@ int is_file(const char *path) {
 
 int count_lines(const char *path) {
   FILE *fp = fopen(path, "r");
-  int happy_lines_count = 0;
-
-  if (fp == NULL) {
-    printf("Error opening file %s\n", "example_dir/example.txt");
-    return 1;
+  if (!fp) return 0;
+  char buf[65536];
+  int count = 0;
+  size_t bytes;
+  while ((bytes = fread(buf, 1, sizeof(buf), fp)) > 0) {
+      for (size_t i = 0; i < bytes; i++)
+          if (buf[i] == '\n') count++;
   }
-
-  for (char c = getc(fp); c != EOF; c = getc(fp)) {
-    if (c == '\n')
-      happy_lines_count++;
-  }
-
-  ++happy_lines_count;
   fclose(fp);
-
-  return happy_lines_count;
+  return count + 1;
 }
 
 void count_happy_lines(const char *path, const char *cwd,
                        int *total_happy_lines_count, DIR *dr,
-                       char ignore_folders[100][100],
-                       int ignore_folders_count) {
+                       char (*ignore_folders)[100], int ignore_folders_count,
+                       int mode) {
 
   for (int i = 0; i < ignore_folders_count; i++) {
     if (strcmp(cwd, ignore_folders[i]) == 0) {
+      if (dr) closedir(dr);
       return;
     }
   }
@@ -78,108 +89,41 @@ void count_happy_lines(const char *path, const char *cwd,
       continue;
     }
     snprintf(full_path, sizeof(full_path), "%s/%s", path, de->d_name);
-    if (is_directory(full_path)) {
+
+    int entry_is_dir = (de->d_type == DT_DIR);
+    int entry_is_file = (de->d_type == DT_REG);
+    if (de->d_type == DT_UNKNOWN || de->d_type == DT_LNK) {
+      entry_is_dir = is_directory(full_path);
+      entry_is_file = !entry_is_dir && is_file(full_path);
+    }
+
+    if (mode == DIRECTORY_MODE && entry_is_dir) {
       count_happy_lines(full_path, de->d_name, total_happy_lines_count,
                         opendir(full_path), ignore_folders,
-                        ignore_folders_count);
-    } else if (is_file(full_path)) {
+                        ignore_folders_count, mode);
+    } else if (entry_is_file) {
       *total_happy_lines_count += count_lines(full_path);
     }
   }
+  closedir(dr);
 }
 
-void clear() {
-#if defined(__linux__) || defined(__unix__) || defined(__APPLE__)
-  system("clear");
-#elif defined(_WIN32) || defined(_WIN64)
-  system("cls");
-#endif
-}
-
-static struct termios orig_termios;
-
-void die(const char *msg) {
-  write(STDOUT_FILENO, CLEAR_SCREEN, sizeof(CLEAR_SCREEN) - 1);
-  perror(msg);
-  exit(1);
-}
-
-void disable_raw_mode() {
-  tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig_termios);
-  write(STDOUT_FILENO, SHOW_CURSOR, sizeof(SHOW_CURSOR) - 1);
-}
-
-void enable_raw_mode() {
-  if (tcgetattr(STDIN_FILENO, &orig_termios) == -1)
-    die("tcgetattr");
-
-  atexit(disable_raw_mode);
-
-  struct termios raw = orig_termios;
-  raw.c_lflag &= ~(ECHO | ICANON | ISIG);
-  raw.c_iflag &= ~(IXON | ICRNL);
-  raw.c_oflag &= ~(OPOST);
-
-  if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) == -1)
-    die("tcsetattr");
-
-  write(STDOUT_FILENO, HIDE_CURSOR, sizeof(HIDE_CURSOR) - 1);
-}
-
-void clear_screen() {
-  write(STDOUT_FILENO, CLEAR_SCREEN, sizeof(CLEAR_SCREEN) - 1);
-}
-
-void draw_at(int y, int x, const char *fmt, ...) {
-  char buf[1000];
-  int offset = sprintf(buf, DRAW_AT_FORMAT, y, x);
-  va_list args;
-  
-  va_start(args, fmt);
-  offset += vsnprintf(buf + offset, sizeof(buf) - offset, fmt, args);
-  va_end(args);
-  write(STDOUT_FILENO, buf, offset);
-}
-
-enum { KEY_UP = 1000, KEY_DOWN, KEY_LEFT, KEY_RIGHT, KEY_ENTER };
-
-int read_key() {
-  char c;
-  if (read(STDIN_FILENO, &c, 1) != 1)
-    return -1;
-
-  if (c == '\x1b') {
-    char seq[2];
-    if (read(STDIN_FILENO, &seq[0], 1) != 1)
-      return '\x1b';
-    if (read(STDIN_FILENO, &seq[1], 1) != 1)
-      return '\x1b';
-
-    if (seq[0] == '[') {
-      switch (seq[1]) {
-      case 'A':
-        return KEY_UP;
-      case 'B':
-        return KEY_DOWN;
-      case 'C':
-        return KEY_RIGHT;
-      case 'D':
-        return KEY_LEFT;
-      }
-    }
-    return '\x1b';
+void *run(void *arg) {
+  struct thread *thread = (struct thread *)arg;
+  for (int i = thread->start; i <= thread->end; ++i) {
+    count_happy_lines(thread->directories[i], thread->directories[i],
+                      &thread->total_happy_lines_count,
+                      opendir(thread->directories[i]), thread->ignore_folders,
+                      thread->ignore_folders_count, thread->mode);
   }
-  if (c == '\r' || c == '\n')
-    return KEY_ENTER;
-
-  return c;
-}
-
-void restore_terminal() {
-  write(STDOUT_FILENO, RESTORE_TERMINAL, sizeof(RESTORE_TERMINAL) - 1);
+  return NULL;
 }
 
 int draw_menu() {
+  struct thread thread[MAX_THREADS];
+
+  int threads = 6;
+
   char ignore_folders[100][100];
   int ignore_folders_count = 0;
   char ignore_folder[100];
@@ -204,22 +148,47 @@ int draw_menu() {
   int x = 4;
 
   while ((de = readdir(dr)) != NULL) {
-    if (is_directory(de->d_name) && strcmp(de->d_name, "..") != 0) {
+    if (is_directory(de->d_name) && strcmp(de->d_name, "..") != 0 &&
+        strcmp(de->d_name, ".") != 0) {
       total_directories++;
     }
   }
 
-  char **arr = (char **)malloc(sizeof(char *) * total_directories);
+  char **directories = (char **)malloc(sizeof(char *) * total_directories);
   int i = 0;
 
   rewinddir(dr);
 
   while ((de = readdir(dr)) != NULL) {
-    if (is_directory(de->d_name) && strcmp(de->d_name, "..") != 0) {
-      arr[i] = (char *)malloc(sizeof(char) * strlen(de->d_name));
-      strcpy(arr[i], de->d_name);
+    if (is_directory(de->d_name) && strcmp(de->d_name, "..") != 0 &&
+        strcmp(de->d_name, ".") != 0) {
+      directories[i] = (char *)malloc(sizeof(char) * (strlen(de->d_name) + 1));
+      strcpy(directories[i], de->d_name);
       i++;
     }
+  }
+
+  closedir(dr);
+
+  if (threads > total_directories) {
+    threads = total_directories;
+  }
+
+  int base = total_directories / threads;
+  int remainder = total_directories % threads;
+  int offset = 0;
+
+  for (int i = 0; i < threads; ++i) {
+    int chunk = base + (i < remainder ? 1 : 0);
+    thread[i].thread_id = i + 1;
+    thread[i].start = offset;
+    thread[i].end = offset + chunk - 1;
+    offset += chunk;
+    thread[i].total_happy_lines_count = 0;
+    thread[i].directories = directories;
+    thread[i].ignore_folders = ignore_folders;
+    thread[i].ignore_folders_count = ignore_folders_count;
+    thread[i].mode = DIRECTORY_MODE;
   }
 
   int y = 2;
@@ -229,7 +198,7 @@ int draw_menu() {
     draw_at(MAIN_HEADER_TITLE_Y, MAIN_HEADER_TITLE_X, "Select a directory:");
 
     for (int j = 0; j < total_directories; j++) {
-      draw_at(j + 2, x, arr[j]);
+      draw_at(j + 2, x, directories[j]);
     }
 
     draw_at(y, 1, ">");
@@ -249,20 +218,41 @@ int draw_menu() {
 
   clear_screen();
 
-  draw_at(1, 0, "Selected directory: %s", arr[y - 2]);
+  for (int i = 0; i < threads; ++i) {
+    pthread_create(&thread[i].thread, NULL, run, (void *)&thread[i]);
+  }
 
-  dr = opendir(arr[y - 2]);
+  for (int i = 0; i < threads; ++i) {
+    pthread_join(thread[i].thread, NULL);
+  }
 
-  count_happy_lines(arr[y - 2], arr[y - 2], &total_happy_lines_count, dr,
-                    ignore_folders, ignore_folders_count);
+  for (int i = 0; i < threads; ++i) {
+    total_happy_lines_count += thread[i].total_happy_lines_count;
+  }
 
-  draw_at(2, 0, "Total happy lines count: %d", total_happy_lines_count);
+  int total_happy_lines_count_file = 0;
 
-  closedir(dr);
+  count_happy_lines(".", ".", &total_happy_lines_count_file, opendir("."),
+                    ignore_folders, ignore_folders_count, FILE_MODE);
+
+  draw_at(2, 0, "Total happy lines count: %d",
+          total_happy_lines_count_file + total_happy_lines_count);
+
   return 0;
 }
 
+void list_directories(const char *path) {
+  DIR *dr = opendir(path);
+  struct dirent *de;
+  while ((de = readdir(dr)) != NULL) {
+    if (is_directory(de->d_name) && strcmp(de->d_name, "..") != 0) {
+      printf("%s\n", de->d_name);
+    }
+  }
+}
+
 int main() {
+  // list_directories(".");
   draw_menu();
   restore_terminal();
   return 0;

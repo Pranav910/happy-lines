@@ -2,4 +2,8 @@ example_dir/
 hello
 dynamic-arrays.c
 sample.txt
-tui.c
+/one
+/two
+/fast-main
+/slow-main
+/thread.c

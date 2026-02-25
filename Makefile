@@ -1,7 +1,7 @@
 # Compiler and flags
 CC = gcc
-CFLAGS =
-TARGET = main
+CFLAGS = -O2 -pthread
+TARGET = fast-main
 
 # Default target: compile the executable
 all: $(TARGET)
