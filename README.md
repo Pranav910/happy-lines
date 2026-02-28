@@ -11,7 +11,7 @@ make run
 ## Avaliable features:
 * Basic TUI for limited interaction
 * Ignore/exclude specific folders
-* Multi-threaded support for reading files parallely
+* Multi-threaded support for reading files in parallel
 
 ## Planned features:
 * More advanced TUI
