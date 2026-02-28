@@ -11,11 +11,11 @@ make run
 ## Avaliable features:
 * Basic TUI for limited interaction
 * Ignore/exclude specific folders
+* Multi-threaded support for reading files parallely
 
 ## Planned features:
 * More advanced TUI
 * Language specific LOC calculator
-* Multi-threaded support for optimization
 * Better Command line arguments
 
 ❤️ Contributions are always welcome
