@@ -7,3 +7,5 @@ sample.txt
 /fast-main
 /slow-main
 /thread.c
+/happy-lines
+/tui.c

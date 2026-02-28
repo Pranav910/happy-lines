@@ -1,4 +1,4 @@
-#include "tui.c"
+#include "argparser.c"
 #include <dirent.h>
 #include <pthread.h>
 #include <stdio.h>
@@ -6,7 +6,7 @@
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
-#include <termios.h>
+#include <time.h>
 
 #define MAIN_HEADER_TITLE_Y 0
 #define MAIN_HEADER_TITLE_X 0
@@ -53,13 +53,15 @@ int is_file(const char *path) {
 
 int count_lines(const char *path) {
   FILE *fp = fopen(path, "r");
-  if (!fp) return 0;
+  if (!fp)
+    return 0;
   char buf[65536];
   int count = 0;
   size_t bytes;
   while ((bytes = fread(buf, 1, sizeof(buf), fp)) > 0) {
-      for (size_t i = 0; i < bytes; i++)
-          if (buf[i] == '\n') count++;
+    for (size_t i = 0; i < bytes; i++)
+      if (buf[i] == '\n')
+        count++;
   }
   fclose(fp);
   return count + 1;
@@ -72,7 +74,8 @@ void count_happy_lines(const char *path, const char *cwd,
 
   for (int i = 0; i < ignore_folders_count; i++) {
     if (strcmp(cwd, ignore_folders[i]) == 0) {
-      if (dr) closedir(dr);
+      if (dr)
+        closedir(dr);
       return;
     }
   }
@@ -119,10 +122,8 @@ void *run(void *arg) {
   return NULL;
 }
 
-int draw_menu() {
+int draw_menu(int threads) {
   struct thread thread[MAX_THREADS];
-
-  int threads = 6;
 
   char ignore_folders[100][100];
   int ignore_folders_count = 0;
@@ -144,7 +145,6 @@ int draw_menu() {
   DIR *dr = opendir(path);
   int total_happy_lines_count = 0;
   int total_directories = 0;
-  enable_raw_mode();
   int x = 4;
 
   while ((de = readdir(dr)) != NULL) {
@@ -191,32 +191,10 @@ int draw_menu() {
     thread[i].mode = DIRECTORY_MODE;
   }
 
-  int y = 2;
+  clock_t start, end;
+  double cpu_time_used;
 
-  while (1) {
-    clear_screen();
-    draw_at(MAIN_HEADER_TITLE_Y, MAIN_HEADER_TITLE_X, "Select a directory:");
-
-    for (int j = 0; j < total_directories; j++) {
-      draw_at(j + 2, x, directories[j]);
-    }
-
-    draw_at(y, 1, ">");
-    write(STDOUT_FILENO, "\x1b[H", 3);
-
-    int key = read_key();
-    if (key == 'q')
-      return 0;
-    if (key == KEY_ENTER)
-      break;
-
-    if (key == KEY_DOWN && y < total_directories + 1)
-      y++;
-    if (key == KEY_UP && y > 2)
-      y--;
-  }
-
-  clear_screen();
+  start = clock();
 
   for (int i = 0; i < threads; ++i) {
     pthread_create(&thread[i].thread, NULL, run, (void *)&thread[i]);
@@ -235,8 +213,12 @@ int draw_menu() {
   count_happy_lines(".", ".", &total_happy_lines_count_file, opendir("."),
                     ignore_folders, ignore_folders_count, FILE_MODE);
 
-  draw_at(2, 0, "Total happy lines count: %d",
-          total_happy_lines_count_file + total_happy_lines_count);
+  end = clock();
+  cpu_time_used = ((double) (end - start)) / CLOCKS_PER_SEC;
+
+  printf("Total happy lines count: %d\n",
+         total_happy_lines_count_file + total_happy_lines_count);
+  printf("Time taken: %f seconds\n", cpu_time_used);
 
   return 0;
 }
@@ -251,9 +233,16 @@ void list_directories(const char *path) {
   }
 }
 
-int main() {
-  // list_directories(".");
-  draw_menu();
-  restore_terminal();
+int main(int argc, char *argv[]) {
+  struct arguments *arguments = parse_arguments(argc, argv);
+  int threads;
+  if (arguments != NULL) {
+    for (int i = 0; i < argc - 1; i++) {
+      threads = *(int *)arguments[i].value;
+    }
+  }
+  printf("Threads: %d\n", threads);
+
+  draw_menu(threads);
   return 0;
 }

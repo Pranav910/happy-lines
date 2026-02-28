@@ -1,7 +1,7 @@
 # Compiler and flags
 CC = gcc
 CFLAGS = -O2 -pthread
-TARGET = fast-main
+TARGET = happy-lines
 
 # Default target: compile the executable
 all: $(TARGET)
