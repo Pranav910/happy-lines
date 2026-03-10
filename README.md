@@ -17,5 +17,6 @@ make run
 * More advanced TUI
 * Language specific LOC calculator
 * Better Command line arguments
+* Call the tool from anywhere inside a directory
 
 ❤️ Contributions are always welcome
