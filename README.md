@@ -100,6 +100,7 @@ happy-lines/
 - More advanced TUI
 - Per-language LOC breakdown
 - Richer command-line argument support
+- Cross-platform support 
 
 ## License
 
