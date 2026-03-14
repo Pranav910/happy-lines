@@ -10,3 +10,10 @@ sample.txt
 /happy-lines
 /tui.c
 .DS_Store
+
+# CMake
+build/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+compile_commands.json
