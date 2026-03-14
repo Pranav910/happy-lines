@@ -6,6 +6,7 @@
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <unistd.h>
 #include <time.h>
 
 #define MAIN_HEADER_TITLE_Y 0
@@ -141,8 +142,18 @@ int draw_menu(int threads) {
   }
 
   struct dirent *de;
-  char path[100] = ".";
+  char *path = getcwd(NULL, 0);
+  if (path == NULL) {
+    printf("Error getting current working directory\n");
+    return 1;
+  }
+
   DIR *dr = opendir(path);
+  if (dr == NULL) {
+    printf("Error opening current working directory\n");
+    return 1;
+  }
+  
   int total_happy_lines_count = 0;
   int total_directories = 0;
   int x = 4;
