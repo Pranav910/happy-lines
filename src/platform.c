@@ -115,3 +115,13 @@ int hl_chdir_to_repo_root(void) {
     if (root[0] == '\0') return -1;
     return hl_chdir(root);
 }
+
+int hl_is_directory(const char *path) {
+    struct stat st;
+    return (stat(path, &st) == 0) && S_ISDIR(st.st_mode);
+}
+
+int hl_is_file(const char *path) {
+    struct stat st;
+    return (stat(path, &st) == 0) && S_ISREG(st.st_mode);
+}

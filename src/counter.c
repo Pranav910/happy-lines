@@ -23,6 +23,17 @@ struct thread_ctx {
     char       **files;
 };
 
+/* Force mode: thread context for directory-based counting */
+struct force_ctx {
+    int          start;
+    int          end;
+    long         total_lines;
+    hl_thread_t  handle;
+    char       **directories;
+    char       (*ignore_folders)[MAX_IGNORE_LEN];
+    int          ignore_folders_count;
+};
+
 /* ─── Line Counting ─── */
 
 static int count_lines(const char *path) {
@@ -110,7 +121,60 @@ static void free_file_list(struct file_list *fl) {
     fl->capacity = 0;
 }
 
-/* ─── Thread Worker ─── */
+/* ─── Force mode: recursive directory walk ─── */
+
+static void count_dir_recursive(const char *path,
+                                char (*ignore_folders)[MAX_IGNORE_LEN],
+                                int ignore_count, long *total) {
+    DIR *dr = opendir(path);
+    if (!dr) return;
+
+    struct dirent *de;
+    char full_path[HL_MAX_PATH];
+
+    while ((de = readdir(dr)) != NULL) {
+        if (de->d_name[0] == '.' &&
+            (de->d_name[1] == '\0' ||
+             (de->d_name[1] == '.' && de->d_name[2] == '\0')))
+            continue;
+
+        snprintf(full_path, sizeof(full_path), "%s%s%s",
+                 path, HL_PATH_SEP_STR, de->d_name);
+
+        int is_dir  = (de->d_type == DT_DIR);
+        int is_file = (de->d_type == DT_REG);
+        if (de->d_type == DT_UNKNOWN || de->d_type == DT_LNK) {
+            is_dir  = hl_is_directory(full_path);
+            is_file = !is_dir && hl_is_file(full_path);
+        }
+
+        if (is_dir) {
+            int skip = 0;
+            for (int i = 0; i < ignore_count; i++) {
+                if (strcmp(de->d_name, ignore_folders[i]) == 0) {
+                    skip = 1;
+                    break;
+                }
+            }
+            if (!skip)
+                count_dir_recursive(full_path, ignore_folders,
+                                   ignore_count, total);
+        } else if (is_file) {
+            *total += count_lines(full_path);
+        }
+    }
+    closedir(dr);
+}
+
+static HL_THREAD_FUNC force_worker(void *arg) {
+    struct force_ctx *ctx = (struct force_ctx *)arg;
+    for (int i = ctx->start; i <= ctx->end; i++)
+        count_dir_recursive(ctx->directories[i], ctx->ignore_folders,
+                           ctx->ignore_folders_count, &ctx->total_lines);
+    HL_THREAD_RETURN;
+}
+
+/* ─── Thread Worker (tracked-files mode) ─── */
 
 static HL_THREAD_FUNC count_worker(void *arg) {
     struct thread_ctx *ctx = (struct thread_ctx *)arg;
@@ -121,7 +185,7 @@ static HL_THREAD_FUNC count_worker(void *arg) {
 
 /* ─── Public API ─── */
 
-int run_loc_count(int threads) {
+int run_loc_count(int threads, int force) {
     char ignore_folders[MAX_IGNORE_FOLDERS][MAX_IGNORE_LEN];
     int  ignore_count = 0;
     char input[MAX_IGNORE_LEN];
@@ -135,6 +199,99 @@ int run_loc_count(int threads) {
         ignore_count++;
     }
 
+    if (force) {
+        /* Force mode: walk all files under current directory (tracked + untracked) */
+        DIR *dr = opendir(".");
+        if (!dr) {
+            fprintf(stderr, "Error: cannot open current directory\n");
+            return 1;
+        }
+
+        char *directories[512];
+        int  num_dirs = 0;
+        long root_lines = 0;
+        char full_path[HL_MAX_PATH];
+        struct dirent *de;
+
+        while ((de = readdir(dr)) != NULL && num_dirs < 512) {
+            if (de->d_name[0] == '.' &&
+                (de->d_name[1] == '\0' ||
+                 (de->d_name[1] == '.' && de->d_name[2] == '\0')))
+                continue;
+
+            snprintf(full_path, sizeof(full_path), ".%s%s",
+                     HL_PATH_SEP_STR, de->d_name);
+
+            int is_dir  = (de->d_type == DT_DIR);
+            int is_file = (de->d_type == DT_REG);
+            if (de->d_type == DT_UNKNOWN || de->d_type == DT_LNK) {
+                is_dir  = hl_is_directory(full_path);
+                is_file = !is_dir && hl_is_file(full_path);
+            }
+
+            if (is_dir) {
+                int skip = 0;
+                for (int i = 0; i < ignore_count; i++) {
+                    if (strcmp(de->d_name, ignore_folders[i]) == 0) {
+                        skip = 1;
+                        break;
+                    }
+                }
+                if (!skip) {
+                    directories[num_dirs] = hl_strdup(de->d_name);
+                    if (directories[num_dirs])
+                        num_dirs++;
+                }
+            } else if (is_file) {
+                root_lines += count_lines(full_path);
+            }
+        }
+        closedir(dr);
+
+        if (threads > MAX_THREADS) threads = MAX_THREADS;
+        if (threads > num_dirs)   threads = (num_dirs > 0) ? num_dirs : 1;
+        if (threads < 1)         threads = 1;
+
+        long total_lines = root_lines;
+        struct force_ctx ctx[MAX_THREADS];
+        int nthreads = (num_dirs > 0) ? threads : 0;
+        int base = (nthreads > 0) ? num_dirs / nthreads : 0;
+        int remainder = (nthreads > 0) ? num_dirs % nthreads : 0;
+        int offset = 0;
+
+        for (int i = 0; i < nthreads; i++) {
+            int chunk = base + (i < remainder ? 1 : 0);
+            ctx[i].start = offset;
+            ctx[i].end = offset + chunk - 1;
+            offset += chunk;
+            ctx[i].total_lines = 0;
+            ctx[i].directories = directories;
+            ctx[i].ignore_folders = ignore_folders;
+            ctx[i].ignore_folders_count = ignore_count;
+        }
+
+        clock_t t_start = clock();
+
+        for (int i = 0; i < nthreads; i++)
+            hl_thread_create(&ctx[i].handle, force_worker, &ctx[i]);
+
+        for (int i = 0; i < nthreads; i++) {
+            hl_thread_join(ctx[i].handle);
+            total_lines += ctx[i].total_lines;
+        }
+
+        for (int i = 0; i < num_dirs; i++)
+            free(directories[i]);
+
+        clock_t t_end   = clock();
+        double  elapsed = (double)(t_end - t_start) / CLOCKS_PER_SEC;
+
+        printf("Total happy lines count: %ld\n", total_lines);
+        printf("Time taken: %f seconds\n", elapsed);
+        return 0;
+    }
+
+    /* Tracked-files mode: only git-tracked files */
     struct file_list fl = get_tracked_files();
     if (fl.count == 0) {
         printf("No tracked files found.\n");

@@ -5,9 +5,10 @@ A fast, multi-threaded lines-of-code (LOC) counter written in C. It counts only 
 ## Features
 
 - **Git-aware counting** — only counts lines in files tracked by git, so untracked and gitignored paths are automatically excluded
+- **Force mode** — `--force` counts all files in the current directory (tracked and untracked); no git required
 - **Multi-threaded scanning** — distributes files across up to 10 threads for parallel line counting
 - **Per-contributor breakdown** — optional `--contributors` flag shows lines added/removed per git author
-- **Folder exclusion** — interactively specify additional tracked folders to ignore (e.g. `vendor`, `dist`)
+- **Folder exclusion** — interactively specify folders to ignore in both normal and force mode (e.g. `vendor`, `dist`)
 - **Configurable thread count** — control parallelism via `--threads=N`
 - **Cross-platform** — platform abstraction layer supports Linux, macOS, and Windows (MSVC & MinGW)
 
@@ -104,13 +105,22 @@ happy-lines --help
 
 ## Usage
 
-> **Important:** `happy-lines` must be run from inside a git repository. If you run it outside a git repo, it will exit immediately with an error.
+> **Normal mode:** `happy-lines` must be run from inside a git repository. Use `--force` to count all files in the current directory without requiring git.
 
-### Basic LOC count
+### Basic LOC count (git-tracked only)
 
 ```bash
 cd /path/to/your/git/repo
 happy-lines --threads=4
+```
+
+### Force mode (all files, no git required)
+
+Count every file under the current directory, including untracked and gitignored files. You can still exclude folders at the prompt.
+
+```bash
+cd /path/to/any/directory
+happy-lines --threads=4 --force
 ```
 
 ### With per-contributor breakdown
@@ -164,12 +174,30 @@ Analyzing git contributions...
 
 ### Running outside a git repository
 
+Without `--force`, the tool requires a git repository:
+
 ```
 $ cd /tmp
 $ happy-lines --threads=4
 
 Error: not inside a git repository.
 happy-lines must be run from within a git repository.
+Use --force to count all files in the current directory.
+```
+
+With `--force`, you can count all files in any directory (no git needed):
+
+```
+$ cd /tmp/some-project
+$ happy-lines --threads=4 --force
+
+Threads: 4
+Mode: force (all files, tracked + untracked)
+Enter the folders to ignore (exit to stop):
+node_modules
+exit
+Total happy lines count: 12345
+Time taken: 0.050000 seconds
 ```
 
 ### Ignoring folders
@@ -187,21 +215,19 @@ Files already excluded by `.gitignore` are never counted regardless of this prom
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
 | `--threads=N` | integer | `1` | Number of threads for parallel file reading (max: 10) |
+| `--force` | boolean | off | Count all files (tracked + untracked); no git required |
 | `--contributors` | boolean | off | Show a per-author breakdown of lines added, removed, and net |
 | `--help` | boolean | — | Print usage information and exit |
 
 ## How It Works
 
-1. Parses CLI arguments (`--threads=N`, `--contributors`, `--help`).
-2. Verifies the current directory is inside a git repository; exits with an error if not.
-3. Changes to the repository root so all file paths are consistent.
-4. Prompts the user for additional folders to exclude.
-5. Runs `git ls-files` to collect all tracked files (anything in `.gitignore` is automatically excluded).
-6. Filters out files in user-specified ignore folders.
-7. Splits the file list evenly across the requested number of threads.
-8. Each thread counts newlines in its assigned files.
-9. Results from all threads are summed and printed alongside elapsed time.
-10. If `--contributors` is enabled, queries `git log --numstat` per author and displays a sorted table.
+1. Parses CLI arguments (`--threads=N`, `--force`, `--contributors`, `--help`).
+2. If `--force` is not set: verifies the current directory is inside a git repository and changes to the repo root; exits with an error if not in a repo.
+3. Prompts the user for folders to exclude (applies in both normal and force mode).
+4. **Normal mode:** Runs `git ls-files` to collect tracked files, filters by ignore list, splits files across threads, and counts lines.
+5. **Force mode:** Recursively walks the current directory, skips ignored folders, splits top-level directories across threads, and counts lines in every file (tracked and untracked).
+6. Results from all threads are summed and printed alongside elapsed time.
+7. If `--contributors` is enabled (and the directory is a git repo), queries `git log --numstat` per author and displays a sorted table.
 
 ## Project Structure
 

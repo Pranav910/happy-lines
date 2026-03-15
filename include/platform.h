@@ -131,5 +131,7 @@ int hl_thread_join(hl_thread_t t);
 char *hl_strdup(const char *s);
 int   hl_is_git_repository(void);
 int   hl_chdir_to_repo_root(void);
+int   hl_is_directory(const char *path);
+int   hl_is_file(const char *path);
 
 #endif /* HL_PLATFORM_H */
