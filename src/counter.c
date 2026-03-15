@@ -1,10 +1,13 @@
 #include "counter.h"
 #include "platform.h"
-#include <time.h>
 
 #define MAX_IGNORE_FOLDERS 100
 #define MAX_IGNORE_LEN     100
 #define INITIAL_FILE_CAP   256
+#define READ_BUF_SIZE      (128 * 1024)  /* 128KB: fewer syscalls, still stack-safe */
+
+/* Cache line size; pad thread contexts to avoid false sharing */
+#define CACHE_LINE_SIZE    64
 
 /* ─── Internal Types ─── */
 
@@ -21,6 +24,7 @@ struct thread_ctx {
     long         total_lines;
     hl_thread_t  handle;
     char       **files;
+    char         _pad[CACHE_LINE_SIZE];  /* avoid false sharing with next ctx */
 };
 
 /* Force mode: thread context for directory-based counting */
@@ -32,20 +36,26 @@ struct force_ctx {
     char       **directories;
     char       (*ignore_folders)[MAX_IGNORE_LEN];
     int          ignore_folders_count;
+    char         _pad[CACHE_LINE_SIZE];  /* avoid false sharing with next ctx */
 };
 
 /* ─── Line Counting ─── */
 
-static int count_lines(const char *path) {
-    FILE *fp = fopen(path, "r");
+static long count_lines(const char *path) {
+    FILE *fp = fopen(path, "rb");
     if (!fp) return 0;
-    char buf[65536];
-    int count = 0;
-    size_t bytes;
-    while ((bytes = fread(buf, 1, sizeof(buf), fp)) > 0) {
-        for (size_t i = 0; i < bytes; i++)
-            if (buf[i] == '\n')
+    setvbuf(fp, NULL, _IOFBF, READ_BUF_SIZE);
+
+    char buf[READ_BUF_SIZE];
+    long count = 0;
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) {
+        const char *p = buf;
+        const char *end = buf + n;
+        while (p < end) {
+            if (*p++ == '\n')
                 count++;
+        }
     }
     fclose(fp);
     return count + 1;
@@ -168,9 +178,12 @@ static void count_dir_recursive(const char *path,
 
 static HL_THREAD_FUNC force_worker(void *arg) {
     struct force_ctx *ctx = (struct force_ctx *)arg;
-    for (int i = ctx->start; i <= ctx->end; i++)
+    long local_total = 0;
+    for (int i = ctx->start; i <= ctx->end; i++) {
         count_dir_recursive(ctx->directories[i], ctx->ignore_folders,
-                           ctx->ignore_folders_count, &ctx->total_lines);
+                           ctx->ignore_folders_count, &local_total);
+    }
+    ctx->total_lines = local_total;
     HL_THREAD_RETURN;
 }
 
@@ -178,8 +191,10 @@ static HL_THREAD_FUNC force_worker(void *arg) {
 
 static HL_THREAD_FUNC count_worker(void *arg) {
     struct thread_ctx *ctx = (struct thread_ctx *)arg;
+    long local_total = 0;
     for (int i = ctx->start; i <= ctx->end; i++)
-        ctx->total_lines += count_lines(ctx->files[i]);
+        local_total += count_lines(ctx->files[i]);
+    ctx->total_lines = local_total;
     HL_THREAD_RETURN;
 }
 
@@ -270,7 +285,7 @@ int run_loc_count(int threads, int force) {
             ctx[i].ignore_folders_count = ignore_count;
         }
 
-        clock_t t_start = clock();
+        double t_start = hl_wall_clock_sec();
 
         for (int i = 0; i < nthreads; i++)
             hl_thread_create(&ctx[i].handle, force_worker, &ctx[i]);
@@ -283,8 +298,7 @@ int run_loc_count(int threads, int force) {
         for (int i = 0; i < num_dirs; i++)
             free(directories[i]);
 
-        clock_t t_end   = clock();
-        double  elapsed = (double)(t_end - t_start) / CLOCKS_PER_SEC;
+        double elapsed = hl_wall_clock_sec() - t_start;
 
         printf("Total happy lines count: %ld\n", total_lines);
         printf("Time taken: %f seconds\n", elapsed);
@@ -326,7 +340,7 @@ int run_loc_count(int threads, int force) {
         ctx[i].files       = fl.paths;
     }
 
-    clock_t t_start = clock();
+    double t_start = hl_wall_clock_sec();
 
     for (int i = 0; i < threads; i++)
         hl_thread_create(&ctx[i].handle, count_worker, &ctx[i]);
@@ -338,8 +352,7 @@ int run_loc_count(int threads, int force) {
     for (int i = 0; i < threads; i++)
         total_lines += ctx[i].total_lines;
 
-    clock_t t_end   = clock();
-    double  elapsed = (double)(t_end - t_start) / CLOCKS_PER_SEC;
+    double elapsed = hl_wall_clock_sec() - t_start;
 
     printf("Total happy lines count: %ld\n", total_lines);
     printf("Time taken: %f seconds\n", elapsed);

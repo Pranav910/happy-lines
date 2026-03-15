@@ -134,4 +134,7 @@ int   hl_chdir_to_repo_root(void);
 int   hl_is_directory(const char *path);
 int   hl_is_file(const char *path);
 
+/** Wall-clock time in seconds (monotonic). Use for measuring elapsed time. */
+double hl_wall_clock_sec(void);
+
 #endif /* HL_PLATFORM_H */

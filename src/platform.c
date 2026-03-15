@@ -1,4 +1,5 @@
 #include "platform.h"
+#include <time.h>
 
 /* ═══════════════════════════════════════════════════════════════════
    Thread Implementation
@@ -124,4 +125,19 @@ int hl_is_directory(const char *path) {
 int hl_is_file(const char *path) {
     struct stat st;
     return (stat(path, &st) == 0) && S_ISREG(st.st_mode);
+}
+
+double hl_wall_clock_sec(void) {
+#ifdef HL_WINDOWS
+    return (double)GetTickCount64() / 1000.0;
+#else
+    struct timespec ts;
+#if defined(CLOCK_MONOTONIC)
+    if (clock_gettime(CLOCK_MONOTONIC, &ts) == 0)
+        return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+#endif
+    if (clock_gettime(CLOCK_REALTIME, &ts) == 0)
+        return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+    return (double)clock() / (double)CLOCKS_PER_SEC;
+#endif
 }
