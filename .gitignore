@@ -10,6 +10,8 @@ sample.txt
 /happy-lines
 /tui.c
 .DS_Store
+/.cache
+/.cursor
 
 # CMake
 build/

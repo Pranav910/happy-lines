@@ -12,6 +12,7 @@ set(SOURCES
     src/argparser.c
     src/counter.c
     src/contributor.c
+    src/hash_map.c
 )
 
 add_executable(${PROJECT_NAME} ${SOURCES})

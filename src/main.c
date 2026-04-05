@@ -25,6 +25,14 @@ int main(int argc, char *argv[]) {
 
     int force = has_flag(&args, "force");
     int show_contributors = has_flag(&args, "contributors");
+    int by_extension = has_flag(&args, "by-extension");
+
+    if (force && by_extension) {
+        fprintf(stderr, "Error: --force and --by-extension cannot be used together\n");
+        free_parsed_args(&args);
+        return 1;
+    }
+    
 
     if (!force) {
         if (!hl_is_git_repository()) {
@@ -47,7 +55,7 @@ int main(int argc, char *argv[]) {
     printf("Threads: %d\n", threads);
     if (force)
         printf("Mode: force (all files, tracked + untracked)\n");
-    run_loc_count(threads, force);
+    run_loc_count(threads, force, by_extension);
 
     if (show_contributors)
         run_contributor_analysis();
