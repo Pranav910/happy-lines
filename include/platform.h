@@ -137,4 +137,7 @@ int   hl_is_file(const char *path);
 /** Wall-clock time in seconds (monotonic). Use for measuring elapsed time. */
 double hl_wall_clock_sec(void);
 
+/** Number of logical CPUs available (falls back to 1 on error). */
+int hl_cpu_count(void);
+
 #endif /* HL_PLATFORM_H */

@@ -141,3 +141,16 @@ double hl_wall_clock_sec(void) {
     return (double)clock() / (double)CLOCKS_PER_SEC;
 #endif
 }
+
+int hl_cpu_count(void) {
+#ifdef HL_WINDOWS
+    SYSTEM_INFO si;
+    GetSystemInfo(&si);
+    return (int)si.dwNumberOfProcessors;
+#elif defined(_SC_NPROCESSORS_ONLN)
+    int n = (int)sysconf(_SC_NPROCESSORS_ONLN);
+    return n > 0 ? n : 1;
+#else
+    return 1;
+#endif
+}

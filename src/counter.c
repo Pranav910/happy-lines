@@ -9,12 +9,11 @@
 #define MAX_IGNORE_LEN     100
 #define INITIAL_FILE_CAP   256
 #define MAX_EXTENSIONS     22
-#define READ_BUF_SIZE      (128 * 1024)  /* 128KB: fewer syscalls, still stack-safe */
+#define READ_BUF_SIZE      (128 * 1024)
 
-/* Cache line size; pad thread contexts to avoid false sharing */
+/* Pad thread contexts to avoid false sharing between adjacent array slots */
 #define CACHE_LINE_SIZE 64
 
-/* Matches contributor.c table framing */
 #define EXT_TABLE_RULE "-------------------------------"
 
 /* ─── Internal Types ─── */
@@ -25,11 +24,11 @@ typedef struct {
 } extension_stat_t;
 
 static extension_stat_t s_ext_totals[MAX_EXTENSIONS] = {
-    { "c", 0 }, 
-    { "h", 0 }, 
-    { "cpp", 0 }, 
-    { "hpp", 0 }, 
-    { "java", 0 }, 
+    { "c", 0 },
+    { "h", 0 },
+    { "cpp", 0 },
+    { "hpp", 0 },
+    { "java", 0 },
     { "py", 0 },
     { "js", 0 },
     { "ts", 0 },
@@ -55,8 +54,7 @@ struct file_list {
     int    capacity;
 };
 
-struct thread_ctx {
-    int            id;
+struct file_worker_ctx {
     int            start;
     int            end;
     long           total_lines;
@@ -67,16 +65,18 @@ struct thread_ctx {
     char           _pad[CACHE_LINE_SIZE];
 };
 
-struct force_ctx {
-    int            start;
-    int            end;
-    long           total_lines;
-    hl_thread_t    handle;
-    char         **directories;
-    char         (*ignore_folders)[MAX_IGNORE_LEN];
-    int            ignore_folders_count;
-    char           _pad[CACHE_LINE_SIZE];
+struct dir_walker_ctx {
+    int              start;
+    int              end;
+    hl_thread_t      handle;
+    char           **directories;
+    char           (*ignore_folders)[MAX_IGNORE_LEN];
+    int              ignore_folders_count;
+    struct file_list collector;
+    char             _pad[CACHE_LINE_SIZE];
 };
+
+/* ─── Helpers ─── */
 
 static const char *extension_from_path(const char *path) {
     const char *dot = strrchr(path, '.');
@@ -123,6 +123,27 @@ static void print_time_taken(double elapsed_sec) {
         printf("Time taken: %f seconds\n", elapsed_sec);
 }
 
+static int file_list_push(struct file_list *fl, const char *path) {
+    if (fl->count >= fl->capacity) {
+        int    new_cap = (fl->capacity == 0) ? INITIAL_FILE_CAP : fl->capacity * 2;
+        char **resized = (char **)realloc(fl->paths, sizeof(char *) * (size_t)new_cap);
+        if (!resized) return -1;
+        fl->paths    = resized;
+        fl->capacity = new_cap;
+    }
+    fl->paths[fl->count] = hl_strdup(path);
+    if (!fl->paths[fl->count]) return -1;
+    fl->count++;
+    return 0;
+}
+
+static int clamp_workers(int requested, int max_allowed, int work_items) {
+    if (requested > max_allowed) requested = max_allowed;
+    if (work_items > 0 && requested > work_items) requested = work_items;
+    if (requested < 1) requested = 1;
+    return requested;
+}
+
 /* ─── Line Counting ─── */
 
 static long count_lines(const char *path) {
@@ -166,7 +187,7 @@ static struct file_list get_tracked_files(void) {
 
         if (fl.count >= fl.capacity) {
             int     new_cap = fl.capacity * 2;
-            char **resized  = (char **)realloc(fl.paths, sizeof(char *) * new_cap);
+            char **resized  = (char **)realloc(fl.paths, sizeof(char *) * (size_t)new_cap);
             if (!resized) break;
             fl.paths    = resized;
             fl.capacity = new_cap;
@@ -215,11 +236,12 @@ static void free_file_list(struct file_list *fl) {
     fl->capacity = 0;
 }
 
-/* ─── Force mode: recursive directory walk ─── */
+/* ─── Directory Walker (force mode, phase 1) ─── */
 
-static void count_dir_recursive(const char *path,
-                                char (*ignore_folders)[MAX_IGNORE_LEN],
-                                int ignore_count, long *total) {
+static void collect_files_recursive(const char *path,
+                                    char (*ignore_folders)[MAX_IGNORE_LEN],
+                                    int ignore_count,
+                                    struct file_list *collector) {
     DIR *dr = opendir(path);
     if (!dr) return;
 
@@ -251,34 +273,32 @@ static void count_dir_recursive(const char *path,
                 }
             }
             if (!skip)
-                count_dir_recursive(full_path, ignore_folders,
-                                    ignore_count, total);
+                collect_files_recursive(full_path, ignore_folders,
+                                        ignore_count, collector);
         } else if (is_file) {
-            *total += count_lines(full_path);
+            file_list_push(collector, full_path);
         }
     }
     closedir(dr);
 }
 
-static HL_THREAD_FUNC force_worker(void *arg) {
-    struct force_ctx *ctx = (struct force_ctx *)arg;
-    long              local_total = 0;
+static HL_THREAD_FUNC dir_walk_worker(void *arg) {
+    struct dir_walker_ctx *ctx = (struct dir_walker_ctx *)arg;
     for (int i = ctx->start; i <= ctx->end; i++) {
-        count_dir_recursive(ctx->directories[i], ctx->ignore_folders,
-                            ctx->ignore_folders_count, &local_total);
+        collect_files_recursive(ctx->directories[i], ctx->ignore_folders,
+                                ctx->ignore_folders_count, &ctx->collector);
     }
-    ctx->total_lines = local_total;
     HL_THREAD_RETURN;
 }
 
-/* ─── Thread Worker (tracked-files mode) ─── */
+/* ─── File Worker (shared by both modes) ─── */
 
-static HL_THREAD_FUNC count_worker(void *arg) {
-    struct thread_ctx *ctx = (struct thread_ctx *)arg;
-    long               local_total = 0;
+static HL_THREAD_FUNC file_worker(void *arg) {
+    struct file_worker_ctx *ctx = (struct file_worker_ctx *)arg;
+    long local_total = 0;
 
     for (int i = ctx->start; i <= ctx->end; i++) {
-        int lines = count_lines(ctx->files[i]);
+        long lines = count_lines(ctx->files[i]);
         local_total += lines;
 
         if (!ctx->by_extension) continue;
@@ -288,15 +308,76 @@ static HL_THREAD_FUNC count_worker(void *arg) {
 
         int prev = hl_hash_map_get(ctx->extension_map, ext);
         if (prev < 0) prev = 0;
-        hl_hash_map_put(ctx->extension_map, ext, prev + lines);
+        hl_hash_map_put(ctx->extension_map, ext, prev + (int)lines);
     }
     ctx->total_lines = local_total;
     HL_THREAD_RETURN;
 }
 
+/* ─── Dispatch file workers over a file list ─── */
+
+static long dispatch_file_workers(struct file_list *fl, int file_workers,
+                                  int by_extension) {
+    int n_fw = clamp_workers(file_workers, MAX_FILE_WORKERS, fl->count);
+
+    struct file_worker_ctx ctx[MAX_FILE_WORKERS];
+    int base      = fl->count / n_fw;
+    int remainder = fl->count % n_fw;
+    int offset    = 0;
+
+    for (int i = 0; i < n_fw; i++) {
+        int chunk = base + (i < remainder ? 1 : 0);
+        ctx[i].start         = offset;
+        ctx[i].end           = offset + chunk - 1;
+        offset              += chunk;
+        ctx[i].total_lines   = 0;
+        ctx[i].files         = fl->paths;
+        ctx[i].by_extension  = by_extension;
+        ctx[i].extension_map = NULL;
+        if (by_extension) {
+            ctx[i].extension_map = hl_hash_map_create(MAX_EXTENSIONS);
+            if (!ctx[i].extension_map) {
+                fprintf(stderr, "Error: cannot allocate extension map\n");
+                for (int j = 0; j < i; j++)
+                    hl_hash_map_destroy(ctx[j].extension_map);
+                return -1;
+            }
+        }
+    }
+
+    for (int i = 0; i < n_fw; i++)
+        hl_thread_create(&ctx[i].handle, file_worker, &ctx[i]);
+
+    for (int i = 0; i < n_fw; i++)
+        hl_thread_join(ctx[i].handle);
+
+    long total_lines = 0;
+    for (int i = 0; i < n_fw; i++)
+        total_lines += ctx[i].total_lines;
+
+    if (by_extension) {
+        for (int j = 0; j < MAX_EXTENSIONS; j++)
+            s_ext_totals[j].lines = 0;
+
+        for (int i = 0; i < n_fw; i++) {
+            for (int j = 0; j < MAX_EXTENSIONS; j++) {
+                int part = hl_hash_map_get(ctx[i].extension_map,
+                                           s_ext_totals[j].ext);
+                if (part >= 0) s_ext_totals[j].lines += part;
+            }
+            hl_hash_map_destroy(ctx[i].extension_map);
+            ctx[i].extension_map = NULL;
+        }
+
+        print_extension_breakdown();
+    }
+
+    return total_lines;
+}
+
 /* ─── Public API ─── */
 
-int run_loc_count(int threads, int force, int by_extension) {
+int run_loc_count(int dir_workers, int file_workers, int force, int by_extension) {
     char ignore_folders[MAX_IGNORE_FOLDERS][MAX_IGNORE_LEN];
     int  ignore_count = 0;
     char input[MAX_IGNORE_LEN];
@@ -313,6 +394,7 @@ int run_loc_count(int threads, int force, int by_extension) {
     printf("\nProcessing files...\n");
 
     if (force) {
+        /* ── Phase 0: enumerate top-level entries ── */
         DIR *dr = opendir(".");
         if (!dr) {
             fprintf(stderr, "Error: cannot open current directory\n");
@@ -320,8 +402,8 @@ int run_loc_count(int threads, int force, int by_extension) {
         }
 
         char *directories[512];
-        int   num_dirs   = 0;
-        long  root_lines = 0;
+        int   num_dirs = 0;
+        struct file_list root_files = { NULL, 0, 0 };
         char  full_path[HL_MAX_PATH];
         struct dirent *de;
 
@@ -354,52 +436,98 @@ int run_loc_count(int threads, int force, int by_extension) {
                     if (directories[num_dirs]) num_dirs++;
                 }
             } else if (is_file) {
-                root_lines += count_lines(full_path);
+                file_list_push(&root_files, full_path);
             }
         }
         closedir(dr);
 
-        if (threads > MAX_THREADS) threads = MAX_THREADS;
-        if (threads > num_dirs) threads = (num_dirs > 0) ? num_dirs : 1;
-        if (threads < 1) threads = 1;
-
-        long              total_lines = root_lines;
-        struct force_ctx  ctx[MAX_THREADS];
-        int               nthreads  = (num_dirs > 0) ? threads : 0;
-        int               base      = (nthreads > 0) ? num_dirs / nthreads : 0;
-        int               remainder = (nthreads > 0) ? num_dirs % nthreads : 0;
-        int               offset    = 0;
-
-        for (int i = 0; i < nthreads; i++) {
-            int chunk                     = base + (i < remainder ? 1 : 0);
-            ctx[i].start                  = offset;
-            ctx[i].end                    = offset + chunk - 1;
-            offset                       += chunk;
-            ctx[i].total_lines            = 0;
-            ctx[i].directories            = directories;
-            ctx[i].ignore_folders         = ignore_folders;
-            ctx[i].ignore_folders_count   = ignore_count;
-        }
-
         double t_start = hl_wall_clock_sec();
 
-        for (int i = 0; i < nthreads; i++)
-            hl_thread_create(&ctx[i].handle, force_worker, &ctx[i]);
+        /* ── Phase 1: directory walkers discover files ── */
+        int n_dw = (num_dirs > 0)
+                       ? clamp_workers(dir_workers, MAX_DIR_WORKERS, num_dirs)
+                       : 0;
+        struct dir_walker_ctx dctx[MAX_DIR_WORKERS];
 
-        for (int i = 0; i < nthreads; i++) {
-            hl_thread_join(ctx[i].handle);
-            total_lines += ctx[i].total_lines;
+        if (n_dw > 0) {
+            int base      = num_dirs / n_dw;
+            int remainder = num_dirs % n_dw;
+            int offset    = 0;
+
+            for (int i = 0; i < n_dw; i++) {
+                int chunk = base + (i < remainder ? 1 : 0);
+                dctx[i].start                = offset;
+                dctx[i].end                  = offset + chunk - 1;
+                offset                      += chunk;
+                dctx[i].directories          = directories;
+                dctx[i].ignore_folders       = ignore_folders;
+                dctx[i].ignore_folders_count = ignore_count;
+                dctx[i].collector.paths      = NULL;
+                dctx[i].collector.count      = 0;
+                dctx[i].collector.capacity   = 0;
+            }
+
+            for (int i = 0; i < n_dw; i++)
+                hl_thread_create(&dctx[i].handle, dir_walk_worker, &dctx[i]);
+
+            for (int i = 0; i < n_dw; i++)
+                hl_thread_join(dctx[i].handle);
         }
 
-        for (int i = 0; i < num_dirs; i++)
-            if (directories[i]) free(directories[i]);
+        /* ── Merge discovered files into one list ── */
+        int total_files = root_files.count;
+        for (int i = 0; i < n_dw; i++)
+            total_files += dctx[i].collector.count;
+
+        struct file_list merged = { NULL, 0, 0 };
+        if (total_files > 0) {
+            merged.paths = (char **)malloc(sizeof(char *) * (size_t)total_files);
+            if (!merged.paths) {
+                fprintf(stderr, "Error: out of memory\n");
+                for (int i = 0; i < n_dw; i++)
+                    free_file_list(&dctx[i].collector);
+                free_file_list(&root_files);
+                for (int i = 0; i < num_dirs; i++) free(directories[i]);
+                return 1;
+            }
+            merged.capacity = total_files;
+
+            for (int i = 0; i < root_files.count; i++)
+                merged.paths[merged.count++] = root_files.paths[i];
+
+            for (int i = 0; i < n_dw; i++) {
+                for (int j = 0; j < dctx[i].collector.count; j++)
+                    merged.paths[merged.count++] = dctx[i].collector.paths[j];
+                free(dctx[i].collector.paths);
+                dctx[i].collector.paths = NULL;
+                dctx[i].collector.count = 0;
+            }
+        }
+        /* String ownership transferred to merged; only free the array shells */
+        free(root_files.paths);
+        root_files.paths = NULL;
+        for (int i = 0; i < num_dirs; i++) free(directories[i]);
+
+        /* ── Phase 2: file workers count lines ── */
+        long total_lines = 0;
+        if (merged.count > 0) {
+            total_lines = dispatch_file_workers(&merged, file_workers, 0);
+            if (total_lines < 0) {
+                free_file_list(&merged);
+                return 1;
+            }
+        }
 
         double elapsed = hl_wall_clock_sec() - t_start;
 
         printf("\nTotal happy lines count: %ld\n", total_lines);
         print_time_taken(elapsed);
+
+        free_file_list(&merged);
         return 0;
     }
+
+    /* ── Git-tracked mode ── */
 
     struct file_list fl = get_tracked_files();
     if (fl.count == 0) {
@@ -416,64 +544,15 @@ int run_loc_count(int threads, int force, int by_extension) {
         return 0;
     }
 
-    if (threads > MAX_THREADS) threads = MAX_THREADS;
-    if (threads > fl.count) threads = fl.count;
-    if (threads < 1) threads = 1;
-
-    struct thread_ctx ctx[MAX_THREADS];
-    int base      = fl.count / threads;
-    int remainder = fl.count % threads;
-    int offset    = 0;
-
-    for (int i = 0; i < threads; i++) {
-        int chunk = base + (i < remainder ? 1 : 0);
-        ctx[i].id             = i + 1;
-        ctx[i].start          = offset;
-        ctx[i].end            = offset + chunk - 1;
-        offset               += chunk;
-        ctx[i].total_lines    = 0;
-        ctx[i].files          = fl.paths;
-        ctx[i].by_extension   = by_extension;
-        ctx[i].extension_map  = NULL;
-        if (by_extension) {
-            ctx[i].extension_map = hl_hash_map_create(MAX_EXTENSIONS);
-            if (!ctx[i].extension_map) {
-                fprintf(stderr, "Error: cannot allocate extension map\n");
-                free_file_list(&fl);
-                return 1;
-            }
-        }
-    }
-
     double t_start = hl_wall_clock_sec();
 
-    for (int i = 0; i < threads; i++)
-        hl_thread_create(&ctx[i].handle, count_worker, &ctx[i]);
-
-    for (int i = 0; i < threads; i++) 
-        hl_thread_join(ctx[i].handle);
-
-    long total_lines = 0;
-    for (int i = 0; i < threads; i++) 
-        total_lines += ctx[i].total_lines;
+    long total_lines = dispatch_file_workers(&fl, file_workers, by_extension);
+    if (total_lines < 0) {
+        free_file_list(&fl);
+        return 1;
+    }
 
     double elapsed = hl_wall_clock_sec() - t_start;
-
-    if (by_extension) {
-        for (int j = 0; j < MAX_EXTENSIONS; j++)
-            s_ext_totals[j].lines = 0;
-
-        for (int i = 0; i < threads; i++) {
-            for (int j = 0; j < MAX_EXTENSIONS; j++) {
-                int part = hl_hash_map_get(ctx[i].extension_map, s_ext_totals[j].ext);
-                if (part >= 0) s_ext_totals[j].lines += part;
-            }
-            hl_hash_map_destroy(ctx[i].extension_map);
-            ctx[i].extension_map = NULL;
-        }
-
-        print_extension_breakdown();
-    }
 
     printf("\nTotal happy lines count: %ld\n", total_lines);
     print_time_taken(elapsed);

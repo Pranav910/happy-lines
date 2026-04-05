@@ -6,11 +6,11 @@ A fast, multi-threaded lines-of-code (LOC) counter written in C. It counts only 
 
 - **Git-aware counting** — only counts lines in files tracked by git, so untracked and gitignored paths are automatically excluded
 - **Force mode** — `--force` counts all files in the current directory (tracked and untracked); no git required
-- **Multi-threaded scanning** — distributes files across up to 10 threads for parallel line counting
+- **Dual worker-pool parallelism** — separate `--directory-workers` and `--file-workers` thread pools for directory traversal and file processing (inspired by SCC)
 - **Per-contributor breakdown** — optional `--contributors` flag shows lines added/removed per git author
 - **LOC by file extension** — optional `--by-extension` prints a table of line counts grouped by extension (git-tracked files only; not compatible with `--force`)
 - **Folder exclusion** — interactively specify folders to ignore in both normal and force mode (e.g. `vendor`, `dist`)
-- **Configurable thread count** — control parallelism via `--threads=N`
+- **Auto-tuned defaults** — worker counts default to the number of logical CPUs on the host
 - **Cross-platform** — platform abstraction layer supports Linux, macOS, and Windows (MSVC & MinGW)
 
 ## Quick Start
@@ -23,7 +23,7 @@ cd happy-lines
 cmake -B build
 cmake --build build
 cd /path/to/your/project    # must be a git repository
-/path/to/happy-lines/build/happy-lines --threads=4
+/path/to/happy-lines/build/happy-lines
 ```
 
 ## Prerequisites
@@ -112,7 +112,14 @@ happy-lines --help
 
 ```bash
 cd /path/to/your/git/repo
-happy-lines --threads=4
+happy-lines
+```
+
+### Custom worker counts
+
+```bash
+happy-lines --file-workers=8
+happy-lines --directory-workers=4 --file-workers=8 --force
 ```
 
 ### Force mode (all files, no git required)
@@ -121,13 +128,13 @@ Count every file under the current directory, including untracked and gitignored
 
 ```bash
 cd /path/to/any/directory
-happy-lines --threads=4 --force
+happy-lines --force
 ```
 
 ### With per-contributor breakdown
 
 ```bash
-happy-lines --threads=4 --contributors
+happy-lines --contributors
 ```
 
 ### LOC by file extension
@@ -135,7 +142,7 @@ happy-lines --threads=4 --contributors
 After the usual folder-ignore prompt, aggregates lines by extension (the part of the filename after the last `.`). Extensions are sorted from most to least lines, then a total row is shown. This mode only applies when counting **git-tracked** files; it cannot be combined with `--force` (the program exits with an error if both flags are set).
 
 ```bash
-happy-lines --threads=4 --by-extension
+happy-lines --by-extension
 ```
 
 **Sample output** (table appears after counting, before the overall total and timing):
@@ -164,20 +171,21 @@ happy-lines --help
 Usage: happy-lines [options]
 
 Options:
-  --threads=N       Number of threads for parallel LOC counting (default: 1, max: 10)
-  --force           Count all files (tracked and untracked); no git required
-  --contributors    Show lines of code per git contributor
-  --by-extension    Show lines of code per file extension (git-tracked only; not with --force)
-  --help            Show this help message
+  --directory-workers=N  Threads for parallel directory traversal (default: CPU count, max: 32)
+  --file-workers=N      Threads for parallel file processing (default: CPU count, max: 32)
+  --force               Count all files (tracked and untracked); no git required
+  --contributors        Show lines of code per git contributor
+  --by-extension        Show lines of code per file extension (git-tracked only; not with --force)
+  --help                Show this help message
 ```
 
 ### Full example session
 
 ```
 $ cd ~/projects/my-app
-$ happy-lines --threads=4 --contributors
+$ happy-lines --file-workers=8 --contributors
 
-Threads: 4
+File workers: 8
 Enter the folders to ignore (exit to stop):
 vendor
 dist
@@ -197,32 +205,33 @@ Analyzing git contributions...
 --------------------------------------------------------------
 ```
 
-### Running outside a git repository
-
-Without `--force`, the tool requires a git repository:
-
-```
-$ cd /tmp
-$ happy-lines --threads=4
-
-Error: not inside a git repository.
-happy-lines must be run from within a git repository.
-Use --force to count all files in the current directory.
-```
-
-With `--force`, you can count all files in any directory (no git needed):
+### Force mode example
 
 ```
 $ cd /tmp/some-project
-$ happy-lines --threads=4 --force
+$ happy-lines --directory-workers=4 --file-workers=8 --force
 
-Threads: 4
+Directory workers: 4
+File workers: 8
 Mode: force (all files, tracked + untracked)
 Enter the folders to ignore (exit to stop):
 node_modules
 exit
 Total happy lines count: 12345
 Time taken: 0.050000 seconds
+```
+
+### Running outside a git repository
+
+Without `--force`, the tool requires a git repository:
+
+```
+$ cd /tmp
+$ happy-lines
+
+Error: not inside a git repository.
+happy-lines must be run from within a git repository.
+Use --force to count all files in the current directory.
 ```
 
 ### Ignoring folders
@@ -239,7 +248,8 @@ Files already excluded by `.gitignore` are never counted regardless of this prom
 
 | Flag | Type | Default | Description |
 |------|------|---------|-------------|
-| `--threads=N` | integer | `1` | Number of threads for parallel file reading (max: 10) |
+| `--directory-workers=N` | integer | CPU count | Threads for parallel directory traversal — used in `--force` mode (max: 32) |
+| `--file-workers=N` | integer | CPU count | Threads for parallel file line counting (max: 32) |
 | `--force` | boolean | off | Count all files (tracked + untracked); no git required |
 | `--contributors` | boolean | off | Show a per-author breakdown of lines added, removed, and net |
 | `--by-extension` | boolean | off | Show LOC grouped by file extension (git-tracked only; mutually exclusive with `--force`) |
@@ -247,13 +257,15 @@ Files already excluded by `.gitignore` are never counted regardless of this prom
 
 ## How It Works
 
-1. Parses CLI arguments (`--threads=N`, `--force`, `--contributors`, `--by-extension`, `--help`).
+1. Parses CLI arguments (`--directory-workers=N`, `--file-workers=N`, `--force`, `--contributors`, `--by-extension`, `--help`).
 2. If both `--force` and `--by-extension` are set, exits with an error (extension breakdown is only implemented for git-tracked files).
 3. If `--force` is not set: verifies the current directory is inside a git repository and changes to the repo root; exits with an error if not in a repo.
 4. Prompts the user for folders to exclude (applies in both normal and force mode).
-5. **Normal mode:** Runs `git ls-files` to collect tracked files, filters by ignore list, splits files across threads, and counts lines. With `--by-extension`, each thread also accumulates per-extension counts; these are merged and printed as a sorted table before the overall total.
-6. **Force mode:** Recursively walks the current directory, skips ignored folders, splits top-level directories across threads, and counts lines in every file (tracked and untracked). Extension breakdown is not available in this mode.
-7. Results from all threads are summed and printed alongside elapsed time.
+5. **Normal mode:** Runs `git ls-files` to collect tracked files, filters by ignore list, dispatches file workers to count lines in parallel. With `--by-extension`, each worker also accumulates per-extension counts; these are merged and printed as a sorted table before the overall total.
+6. **Force mode (two-phase pipeline):**
+   - *Phase 1 — Directory walking:* Enumerates top-level subdirectories, distributes them across directory-worker threads. Each worker recursively walks its assigned directories and collects discovered file paths into a per-thread list.
+   - *Phase 2 — File processing:* All per-thread file lists are merged, then split across file-worker threads for parallel line counting.
+7. Results from all workers are summed and printed alongside elapsed time.
 8. If `--contributors` is enabled (and the directory is a git repo), queries `git log --numstat` per author and displays a sorted table.
 
 ## Project Structure
